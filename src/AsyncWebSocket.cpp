@@ -1223,11 +1223,18 @@ void AsyncWebSocket::_cleanBuffers()
 {
   AsyncWebLockGuard l(_lock);
 
+  AsyncWebSocketMessageBuffer *remove = nullptr;
   for(AsyncWebSocketMessageBuffer * c: _buffers){
+    if(remove) {
+        _buffers.remove(remove);
+        remove = nullptr;
+    }
     if(c && c->canDelete()){
-        _buffers.remove(c);
+        remove = c;
     }
   }
+  if(remove)
+    _buffers.remove(remove);
 }
 
 
