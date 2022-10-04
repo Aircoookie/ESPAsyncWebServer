@@ -354,13 +354,12 @@ void SPIFFSEditor::handleRequest(AsyncWebServerRequest *request){
         String fname = entry.name();
         if (fname.indexOf("wsec") == -1) {
           if (output != "[") output += ',';
-          output += "{\"type\":\"";
-          output += "file";
-          output += "\",\"name\":\"";
+          output += "{\"type\":\"file\",\"name\":\"";
+          if (fname[0] != '/') output += '/';
           output += fname;
           output += "\",\"size\":";
           output += String(entry.size());
-          output += "}";
+          output += '}';
         }
 #ifdef ESP32
         entry = dir.openNextFile();
@@ -371,7 +370,7 @@ void SPIFFSEditor::handleRequest(AsyncWebServerRequest *request){
 #ifdef ESP32
       dir.close();
 #endif
-      output += "]";
+      output += ']';
       request->send(200, "application/json", output);
       output = String();
     }

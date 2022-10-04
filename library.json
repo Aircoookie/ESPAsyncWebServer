@@ -1,18 +1,22 @@
 {
-  "name":"ESP Async WebServer",
+  "name":"ESPAsyncWebServerAircoookie",
   "description":"Asynchronous HTTP and WebSocket Server Library for ESP8266 and ESP32 (Aircoookie fork)",
   "keywords":"http,async,websocket,webserver",
-  "authors":
-  {
-    "name": "Hristo Gochkov",
-    "maintainer": true
-  },
+  "authors": [
+    {
+      "name": "Hristo Gochkov"
+    },
+    {
+      "name": "Christian Schwinne",
+      "maintainer": true
+    }
+  ],
   "repository":
   {
     "type": "git",
-    "url": "https://github.com/me-no-dev/ESPAsyncWebServer.git"
+    "url": "https://github.com/Aircoookie/ESPAsyncWebServer.git"
   },
-  "version": "2.0.6",
+  "version": "2.0.7",
   "license": "LGPL-3.0",
   "frameworks": "arduino",
   "platforms": ["espressif8266", "espressif32"],
