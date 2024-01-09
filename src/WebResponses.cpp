@@ -295,11 +295,11 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       outLen = ((_contentLength - _sentLength) > space)?space:(_contentLength - _sentLength);
     }
 
-    uint8_t *buf = (uint8_t *)malloc(outLen+headLen);
-    if (!buf) {
-      // os_printf("_ack malloc %d failed\n", outLen+headLen);
-      return 0;
+    if (_pkt_buf.size() < (outLen + headLen)) {
+      // Make it bigger without preserving the existing contents
+      _pkt_buf = decltype(_pkt_buf) ( (size_t) (outLen+headLen) );
     }
+    uint8_t *buf = _pkt_buf.data();
 
     if(headLen){
       memcpy(buf, _head.c_str(), _head.length());
@@ -312,7 +312,6 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       // See RFC2616 sections 2, 3.6.1.
       readLen = _fillBufferAndProcessTemplates(buf+headLen+6, outLen - 8);
       if(readLen == RESPONSE_TRY_AGAIN){
-          free(buf);
           return 0;
       }
       outLen = sprintf((char*)buf+headLen, "%x", readLen) + headLen;
@@ -325,7 +324,6 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     } else {
       readLen = _fillBufferAndProcessTemplates(buf+headLen, outLen);
       if(readLen == RESPONSE_TRY_AGAIN){
-          free(buf);
           return 0;
       }
       outLen = readLen + headLen;
@@ -344,8 +342,6 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     } else {
         _sentLength += outLen - headLen;
     }
-
-    free(buf);
 
     if((_chunked && readLen == 0) || (!_sendContentLength && outLen == 0) || (!_chunked && _sentLength == _contentLength)){
       _state = RESPONSE_WAIT_ACK;
