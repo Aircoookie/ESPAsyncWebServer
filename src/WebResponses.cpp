@@ -503,39 +503,16 @@ void AsyncFileResponse::_setContentType(const String& path){
   else _contentType = F("text/plain");
 }
 
-AsyncFileResponse::AsyncFileResponse(FS &fs, const String& path, const String& contentType, bool download, AwsTemplateProcessor callback): AsyncAbstractResponse(callback){
-  _code = 200;
-  _path = path;
-
-  if(!download && !fs.exists(_path) && fs.exists(_path+".gz")){
-    _path = _path+".gz";
-    addHeader(F("Content-Encoding"), F("gzip"));
-    _callback = nullptr; // Unable to process zipped templates
-    _sendContentLength = true;
-    _chunked = false;
+static File fs_open_zipped(FS& fs, const String& path, bool force_absolute) {
+  if (!force_absolute && !fs.exists(path)) {
+    auto gz_path = path + F(".gz");
+    if (fs.exists(gz_path)) return fs.open(gz_path, "r");
   }
+  return fs.open(path, "r");
+};
 
-  _content = fs.open(_path, "r");
-  _contentLength = _content.size();
-
-  if(contentType == "")
-    _setContentType(path);
-  else
-    _contentType = contentType;
-
-  int filenameStart = path.lastIndexOf('/') + 1;
-  char buf[26+path.length()-filenameStart];
-  char* filename = (char*)path.c_str() + filenameStart;
-
-  if(download) {
-    // set filename and force download
-    snprintf_P(buf, sizeof (buf), PSTR("attachment; filename=\"%s\""), filename);
-  } else {
-    // force rendering
-    snprintf_P(buf, sizeof (buf), PSTR("inline"));
-  }
-  addHeader(F("Content-Disposition"), buf);
-}
+AsyncFileResponse::AsyncFileResponse(FS &fs, const String& path, const String& contentType, bool download, AwsTemplateProcessor callback) 
+  : AsyncFileResponse(fs_open_zipped(fs, path, download), path, contentType, download, callback) {};
 
 AsyncFileResponse::AsyncFileResponse(File content, const String& path, const String& contentType, bool download, AwsTemplateProcessor callback): AsyncAbstractResponse(callback){
   _code = 200;
@@ -551,7 +528,7 @@ AsyncFileResponse::AsyncFileResponse(File content, const String& path, const Str
   _content = content;
   _contentLength = _content.size();
 
-  if(contentType == "")
+  if(contentType.length() == 0)
     _setContentType(path);
   else
     _contentType = contentType;
