@@ -30,7 +30,7 @@ static const String SharedEmptyString = String();
 
 #define __is_param_char(c) ((c) && ((c) != '{') && ((c) != '[') && ((c) != '&') && ((c) != '='))
 
-enum { PARSE_REQ_START, PARSE_REQ_HEADERS, PARSE_REQ_BODY, PARSE_REQ_END, PARSE_REQ_FAIL };
+enum { PARSE_REQ_START, PARSE_REQ_HEADERS, PARSE_REQ_BODY, PARSE_REQ_END=100, PARSE_REQ_FAIL, PARSE_REQ_QUEUED=200, PARSE_REQ_DEFERRED=201 };
 
 #ifdef ASYNCWEBSERVER_DEBUG_TRACE
 #define DEBUG_PRINTFP(fmt, ...) Serial.printf_P(PSTR("[%u]{%d}" fmt "\n"), (unsigned) millis(), ESP.getFreeHeap(), ##__VA_ARGS__)
@@ -38,9 +38,27 @@ enum { PARSE_REQ_START, PARSE_REQ_HEADERS, PARSE_REQ_BODY, PARSE_REQ_END, PARSE_
 #define DEBUG_PRINTFP(...)
 #endif
 
-AsyncWebServerRequest::AsyncWebServerRequest(AsyncWebServer* s, AsyncClient* c)
-  : _client(c)
-  , _server(s)
+// compatibility shim for old arduino cores
+#if !defined(ESP8266) && !defined(ESP_ARDUINO_VERSION_MAJOR)
+static bool concat(String& s, char* p, unsigned l) {
+  if (l == 0) return false;
+  s.reserve(s.length() + l);  
+  char end_c = p[l-1];
+  if (l > 1) {
+    p[l-1] = 0;
+    s.concat(p);
+    p[l-1] = end_c;
+  }
+  s.concat(end_c);  
+  return true;
+}
+#else
+static inline bool concat(String& s, char* p, unsigned l) { return s.concat(p, l); };
+#endif
+
+AsyncWebServerRequest::AsyncWebServerRequest(AsyncWebServer* server, AsyncClient* client)
+  : _client(client)
+  , _server(server)
   , _handler(NULL)
   , _response(NULL)
   , _temp()
@@ -76,12 +94,12 @@ AsyncWebServerRequest::AsyncWebServerRequest(AsyncWebServer* s, AsyncClient* c)
   , _tempObject(NULL)
 {
   DEBUG_PRINTFP("(%d) WR created", (intptr_t)this);
-  c->onError([](void *r, AsyncClient* c, int8_t error){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onError(error); }, this);
-  c->onAck([](void *r, AsyncClient* c, size_t len, uint32_t time){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onAck(len, time); }, this);
-  c->onDisconnect([](void *r, AsyncClient* c){ AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onDisconnect(); delete c; }, this);
-  c->onTimeout([](void *r, AsyncClient* c, uint32_t time){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onTimeout(time); }, this);
-  c->onData([](void *r, AsyncClient* c, void *buf, size_t len){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onData(buf, len); }, this);
-  c->onPoll([](void *r, AsyncClient* c){ (void)c; AsyncWebServerRequest *req = ( AsyncWebServerRequest*)r; req->_onPoll(); }, this);
+  _client->onError([](void *r, AsyncClient* c, int8_t error){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onError(error); }, this);
+  _client->onAck([](void *r, AsyncClient* c, size_t len, uint32_t time){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onAck(len, time); }, this);
+  _client->onDisconnect([](void *r, AsyncClient* c){ AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onDisconnect(); delete c; }, this);
+  _client->onTimeout([](void *r, AsyncClient* c, uint32_t time){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onTimeout(time); }, this);
+  _client->onData([](void *r, AsyncClient* c, void *buf, size_t len){ (void)c; AsyncWebServerRequest *req = (AsyncWebServerRequest*)r; req->_onData(buf, len); }, this);
+  _client->onPoll([](void *r, AsyncClient* c){ (void)c; AsyncWebServerRequest *req = ( AsyncWebServerRequest*)r; req->_onPoll(); }, this);
 }
 
 AsyncWebServerRequest::~AsyncWebServerRequest(){
@@ -105,39 +123,34 @@ AsyncWebServerRequest::~AsyncWebServerRequest(){
   if(_tempFile){
     _tempFile.close();
   }
+
+  _server->_dequeue(this);
   
   DEBUG_PRINTFP("(%d) WR destructed", (intptr_t)this);
 }
 
 void AsyncWebServerRequest::_onData(void *buf, size_t len){
-  size_t i = 0;
+ 
   while (true) {
 
   if(_parseState < PARSE_REQ_BODY){
     // Find new line in buf
-    char *str = (char*)buf;
-    for (i = 0; i < len; i++) {
-      if (str[i] == '\n') {
-        break;
-      }
-    }
-    if (i == len) { // No new line, just add the buffer in _temp
-      char ch = str[len-1];
-      str[len-1] = 0;
-      _temp.reserve(_temp.length()+len);
-      _temp.concat(str);
-      _temp.concat(ch);
-    } else { // Found new line - extract it and parse
-      str[i] = 0; // Terminate the string at the end of the line.
-      _temp.concat(str);
+    char* str = (char*) buf;
+    char* nl = (char*) memchr(buf, '\n', len);
+    if (nl != nullptr) { // Found new line - extract it and parse
+      size_t line_len = nl - str;
+      concat(_temp, str, line_len);
       _temp.trim();
       _parseLine();
-      if (++i < len) {
+      if (++line_len+1 < len) {
         // Still have more buffer to process
-        buf = str+i;
-        len-= i;
+        buf = (void*) (str + line_len);
+        len -= line_len;
         continue;
       }
+    } else {
+      // No new line, just add the buffer in _temp
+      concat(_temp, str, len);
     }
   } else if(_parseState == PARSE_REQ_BODY){
     // A handler should be already attached at this point in _parseLine function.
@@ -179,10 +192,7 @@ void AsyncWebServerRequest::_onData(void *buf, size_t len){
       }
     }
     if(_parsedLength == _contentLength){
-      _parseState = PARSE_REQ_END;
-      //check if authenticated before calling handleRequest and request auth instead
-      if(_handler) _handler->handleRequest(this);
-      else send(501);
+      _requestReady();
     }
   }
   break;
@@ -202,7 +212,9 @@ void AsyncWebServerRequest::_removeNotInterestingHeaders(){
 
 void AsyncWebServerRequest::_onPoll(){
   //os_printf("p\n");
-  if(_response != NULL && _client != NULL && _client->canSend() && !_response->_finished()){
+  if (_parseState == PARSE_REQ_QUEUED) {
+    _server->processQueue();
+  } else if(_response != NULL && _client != NULL && _client->canSend() && !_response->_finished()){
     _response->_ack(this, 0, 0);
   }
 }
@@ -580,26 +592,46 @@ void AsyncWebServerRequest::_parseLine(){
     if(!_temp.length()){
       //end of headers
       _server->_rewriteRequest(this);
-      DEBUG_PRINTFP("(%d) WR ready %s", (intptr_t) this, url().c_str());
       _server->_attachHandler(this);
       _removeNotInterestingHeaders();
+
       if(_expectingContinue){
         const static char response[] PROGMEM = "HTTP/1.1 100 Continue\r\n\r\n";
-        char response_stack[sizeof(response)];  // stack, so we can pull it out of flash memory
-        memcpy_P(response_stack, response, sizeof(response));
+          char response_stack[sizeof(response)];  // stack, so we can pull it out of flash memory
+          memcpy_P(response_stack, response, sizeof(response));
         _client->write(response_stack, os_strlen(response_stack));
-      }
+      }    
+
       //check handler for authentication
       if(_contentLength){
         _parseState = PARSE_REQ_BODY;
       } else {
-        _parseState = PARSE_REQ_END;
-        if(_handler) _handler->handleRequest(this);
-        else send(501);
-      }
+        _requestReady();
+      }      
     } else _parseReqHeader();
   }
 }
+
+void AsyncWebServerRequest::_requestReady() {
+    //check if authenticated before calling handleRequest and request auth instead
+    DEBUG_PRINTFP("(%d) WR handler ready %s", (intptr_t) this, url().c_str());
+    if(_handler) {
+      _parseState = PARSE_REQ_QUEUED;
+      _server->processQueue();
+    }
+    else {
+      _parseState = PARSE_REQ_END;
+      send(501);
+    }
+}
+
+void AsyncWebServerRequest::_handleRequest() {
+  // Shouldn't be possible to land here without a handler
+  assert(_handler);
+  DEBUG_PRINTFP("(%d) WR handler running", (intptr_t) this);
+  _parseState = PARSE_REQ_END;
+  _handler->handleRequest(this);
+};
 
 size_t AsyncWebServerRequest::headers() const{
   return _headers.length();
@@ -723,6 +755,7 @@ void AsyncWebServerRequest::addInterestingHeader(const String& name){
 }
 
 void AsyncWebServerRequest::send(AsyncWebServerResponse *response){
+  DEBUG_PRINTFP("(%d) WR added response %d",(intptr_t)this, (intptr_t)response);
   _response = response;
   if(_response == NULL){
     _client->close(true);
@@ -1020,4 +1053,11 @@ bool AsyncWebServerRequest::isExpectedRequestedConnType(RequestedConnectionType 
     if ((erct2 != RCT_NOT_USED) && (erct2 == _reqconntype)) res = true;
     if ((erct3 != RCT_NOT_USED) && (erct3 == _reqconntype)) res = true;
     return res;
+}
+
+void AsyncWebServerRequest::deferResponse() {
+  // Ask the server to put us on the back of the queue
+  DEBUG_PRINTFP("(%d) WR defer", (intptr_t) this);
+  _parseState = PARSE_REQ_DEFERRED;
+  // Queue processing loop will handle it from here
 }

@@ -41,13 +41,15 @@ class DynamicBuffer {
   // Accessors
   char* data() const { return _data; };
   size_t size() const { return _len; };
+  char& operator[](ptrdiff_t p) const { return *(_data + p); };
 
   explicit operator bool() const { return (_data != nullptr) && (_len > 0); }
 
   // Release the buffer without freeing it
   char* release() { char* temp = _data; _data = nullptr; _len = 0; return temp; }
 
-  // TODO, if it ever matters - resizing
+  // Resize the buffer.  Returns new size on success, current size on failure.
+  size_t resize(size_t);
 };
 
 // Same interface as DynamicBuffer, but with shared_ptr semantics: buffer is held until last copy releases it.
@@ -67,6 +69,7 @@ class SharedBuffer {
 
   char* data() const { return _buf ? _buf->data() : nullptr; };
   size_t size() const { return _buf ? _buf->size() : 0U; };
+  char& operator[](ptrdiff_t p) const { return *(data() + p); };
   void clear() { _buf.reset(); };
 
   explicit operator bool() const { return _buf && *_buf; };
@@ -150,3 +153,85 @@ class BufferListPrint : public Print {
 typedef BufferListPrint<DynamicBufferList> DynamicBufferListPrint;
 typedef BufferListPrint<SharedBufferList> SharedBufferListPrint;
 
+
+// Walkable buffer
+// A buffer class that permits "consuming" data from either end, adjusting data() and size() to match
+template<typename buffer_type>
+class Walkable
+{
+  buffer_type _buf;
+  size_t _left, _right;
+
+  public:
+  Walkable() : _left(0), _right(0) {};
+  explicit Walkable(size_t len) : _buf(len), _left(0), _right(0) {};
+  Walkable(const char* buf, size_t len) : _buf(buf, len), _left(0), _right(0) {};
+  explicit Walkable(const String& s) : _buf(s), _left(0), _right(0) {};
+  explicit Walkable(String&& s) : _buf(std::move(s)), _left(0), _right(0) {};
+
+  // Accessors
+  // Buffer interface
+  char* data() const { return _buf.data() + _left; };
+  size_t size() const { return _buf.size() - (_left + _right); };
+  size_t capacity() const { return _buf.size(); };  // for similarity with STL types
+  explicit operator bool() const { return (buffer_type::data() != nullptr) && (size() > 0); }
+  char& operator[](ptrdiff_t p) const { return *(data() + p); };
+  void clear() { _buf.clear(); reset(); };
+
+  // Raw interface
+  const buffer_type& buffer() const { return _buf; };
+  size_t offset() const { return _left; }
+  size_t roffset() const { return _right; }  
+  
+  // Modifiers
+  void reset() { _left = _right = 0; }; // Reset the walking counters
+  void advance(ptrdiff_t count) { // Consume some data from the left hand side
+    if (count > 0) {
+      _left = std::min(_left+count, _buf.size() - _right);
+    } else {
+      if (abs(count) <= _left) {
+        _left += count;
+      } else {
+        _left = 0;  // do not wrap
+      }
+    }
+  }
+  void radvance(ptrdiff_t count) {  // Consume some data from the right hand side
+    if (count > 0) {
+      _right = std::min(_right+count, _buf.size() - _left);
+    } else {
+      if (abs(count) <= _right) {
+        _right += count;
+      } else {
+        _right = 0;  // do not wrap
+      }
+    }
+  }
+
+  // Contract buffer to specified size
+  size_t resize(size_t s) {
+    auto bs = _buf.size() - _left;    
+    _right = s <= bs ? (bs - s) : 0U;
+    return size();
+  }
+
+  // Resize the underlying buffer storage, preserving contents
+  // Returns new size on success, current size on failure.
+  size_t reallocate(size_t s) {
+    if (s <= size()) {
+      auto new_buf = buffer_type(data(), s);
+      if (new_buf) {
+        _buf = std::move(new_buf);
+        reset();
+      }
+    } else {
+      auto new_buf = buffer_type(s);
+      if (new_buf) {
+        memcpy(new_buf.data(), data(), size());
+        _buf = std::move(new_buf);
+        reset();
+      }
+    }
+    return _buf.size();
+  }
+};

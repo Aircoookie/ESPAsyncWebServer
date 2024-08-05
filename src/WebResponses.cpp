@@ -336,7 +336,7 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       // Complete the cached data
       auto written = request->client()->add((const char*) _packet.data(), std::min(space, (size_t) _packet.size()));
       _writtenLength += written;
-      _packet.erase(_packet.begin(), _packet.begin() + written);
+      _packet.advance(written);
       space -= written;
       if (_packet.size()) {
         //  Couldn't queue the full cache
@@ -345,6 +345,7 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       }
       needs_send = true;
     }
+    _packet.reset();
 
     size_t outLen, readLen;
     if(_chunked){
@@ -368,22 +369,23 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
         do { 
           dealloc_vector(_packet);
           outLen = std::min(outLen, max_block_size);
-          _packet.resize(outLen);
+          _packet.reallocate(outLen);
           max_block_size = ESP.getMaxFreeBlockSize() - 128;
           DEBUG_PRINTFP("(%d) Checking %d vs %d\n", (intptr_t)this, outLen, max_block_size);
         } while (max_block_size < outLen);
       } else {
-        _packet.resize(outLen);
+        _packet.reallocate(outLen);
       }
     }
 #else
-  _packet.resize(outLen);
+    //Serial.printf("[%u] %d/%d -> %d\n", (unsigned) millis(),  ESP.getMaxAllocHeap(), ESP.getFreeHeap(), outLen);
+    _packet.reallocate(outLen);
 #endif
     
     if(_chunked){      
       // HTTP 1.1 allows leading zeros in chunk length. Or spaces may be added.
       // See RFC2616 sections 2, 3.6.1.
-      readLen = _fillBufferAndProcessTemplates(_packet.data() + 6, outLen - 8);
+      readLen = _fillBufferAndProcessTemplates((uint8_t*) (_packet.data() + 6), outLen - 8);
       if(readLen == RESPONSE_TRY_AGAIN){
           _packet.clear();
           goto content_abort;
@@ -395,9 +397,8 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       outLen += readLen;
       _packet[outLen++] = '\r';
       _packet[outLen++] = '\n';
-      
     } else {
-      readLen = _fillBufferAndProcessTemplates(_packet.data(), _packet.size());
+      readLen = _fillBufferAndProcessTemplates((uint8_t*)_packet.data(), _packet.size());
       if(readLen == RESPONSE_TRY_AGAIN){
           _packet.clear();
           goto content_abort;
@@ -409,14 +410,14 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     if(_packet.size()){      
         auto acceptedLen = request->client()->write((const char*)_packet.data(), _packet.size());
         _writtenLength += acceptedLen;
-        _packet.erase(_packet.begin(), _packet.begin() + acceptedLen);
+        _packet.advance(acceptedLen);
         if (acceptedLen < outLen) {
           // Save the unsent block in cache
           DEBUG_PRINTFP("(%d) Incomplete write, %d/%d\nHeap: %d/%d\nSpace:%d\n", (intptr_t) this, acceptedLen, outLen, ESP.GET_MAX_BLOCK_SIZE(), ESP.getFreeHeap(), request->client()->space());
           // Try again, with less
           acceptedLen = request->client()->write((const char*)_packet.data(), _packet.size()/2);
           _writtenLength += acceptedLen;
-          _packet.erase(_packet.begin(), _packet.begin() + acceptedLen);
+          _packet.advance(acceptedLen);
         }
         DEBUG_PRINTFP("(%d) Accepted: %d\n", (intptr_t) this, acceptedLen);
         if (_packet.size() == 0) dealloc_vector(_packet);
@@ -452,7 +453,7 @@ size_t AsyncAbstractResponse::_readDataFromCacheOrContent(uint8_t* data, const s
     const size_t readFromCache = std::min(len, _cache.size());
     if(readFromCache) {
       memcpy(data, _cache.data(), readFromCache);
-      _cache.erase(_cache.begin(), _cache.begin() + readFromCache);
+      _cache.advance(readFromCache);
     }
     // If we need to read more...
     if (len > readFromCache) {
@@ -465,6 +466,16 @@ size_t AsyncAbstractResponse::_readDataFromCacheOrContent(uint8_t* data, const s
       if (readFromCache == 0) return readFromContent;
     } 
     return readFromCache;
+}
+
+static void push_front(Walkable<DynamicBuffer>& buf, const uint8_t* data, const uint8_t* end) {
+  auto size = end - data;
+  auto old_size = buf.size();
+  auto new_buf = Walkable<DynamicBuffer> { old_size + size };
+  // TODO: error checks
+  memcpy(new_buf.data(), data, size);
+  memcpy(new_buf.data() + size, buf.data(), old_size);
+  buf = std::move(new_buf);
 }
 
 size_t AsyncAbstractResponse::_fillBufferAndProcessTemplates(uint8_t* data, size_t len)
@@ -506,13 +517,13 @@ size_t AsyncAbstractResponse::_fillBufferAndProcessTemplates(uint8_t* data, size
           *pTemplateEnd = 0;
           paramName = String(reinterpret_cast<char*>(buf));
           // Copy remaining read-ahead data into cache
-          _cache.insert(_cache.begin(), pTemplateEnd + 1, buf + (&data[len - 1] - pTemplateStart) + readFromCacheOrContent);
+          push_front(_cache, pTemplateEnd + 1, buf + (&data[len - 1] - pTemplateStart) + readFromCacheOrContent);
           pTemplateEnd = &data[len - 1];
         }
         else // closing placeholder not found in file data, store found percent symbol as is and advance to the next position
         {
           // but first, store read file data in cache
-          _cache.insert(_cache.begin(), buf + (&data[len - 1] - pTemplateStart), buf + (&data[len - 1] - pTemplateStart) + readFromCacheOrContent);
+          push_front(_cache, buf + (&data[len - 1] - pTemplateStart), buf + (&data[len - 1] - pTemplateStart) + readFromCacheOrContent);
           ++pTemplateStart;
         }
       }
@@ -534,7 +545,7 @@ size_t AsyncAbstractResponse::_fillBufferAndProcessTemplates(uint8_t* data, size
       // make room for param value
       // 1. move extra data to cache if parameter value is longer than placeholder AND if there is no room to store
       if((pTemplateEnd + 1 < pTemplateStart + numBytesCopied) && (originalLen - (pTemplateStart + numBytesCopied - pTemplateEnd - 1) < len)) {
-        _cache.insert(_cache.begin(), &data[originalLen - (pTemplateStart + numBytesCopied - pTemplateEnd - 1)], &data[len]);
+        push_front(_cache, &data[originalLen - (pTemplateStart + numBytesCopied - pTemplateEnd - 1)], &data[len]);
         //2. parameter value is longer than placeholder text, push the data after placeholder which not saved into cache further to the end
         memmove(pTemplateStart + numBytesCopied, pTemplateEnd + 1, &data[originalLen] - pTemplateStart - numBytesCopied);
         len = originalLen; // fix issue with truncated data, not sure if it has any side effects
@@ -546,7 +557,7 @@ size_t AsyncAbstractResponse::_fillBufferAndProcessTemplates(uint8_t* data, size
       memcpy(pTemplateStart, pvstr, numBytesCopied);
       // If result is longer than buffer, copy the remainder into cache (this could happen only if placeholder text itself did not fit entirely in buffer)
       if(numBytesCopied < pvlen) {
-        _cache.insert(_cache.begin(), pvstr + numBytesCopied, pvstr + pvlen);
+        push_front(_cache, (uint8_t*) pvstr + numBytesCopied,  (uint8_t*) pvstr + pvlen);
       } else if(pTemplateStart + numBytesCopied < pTemplateEnd + 1) { // result is copied fully; if result is shorter than placeholder text...
         // there is some free room, fill it from cache
         const size_t roomFreed = pTemplateEnd + 1 - pTemplateStart - numBytesCopied;

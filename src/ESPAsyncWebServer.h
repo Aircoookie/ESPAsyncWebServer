@@ -29,8 +29,10 @@
 #include "StringArray.h"
 
 #ifdef ESP32
+#include <mutex>
 #include <WiFi.h>
 #include <AsyncTCP.h>
+#define ASYNCWEBSERVER_NEEDS_MUTEX
 #elif defined(ESP8266)
 #include <ESP8266WiFi.h>
 #include <ESPAsyncTCP.h>
@@ -195,6 +197,9 @@ class AsyncWebServerRequest {
     void _parsePlainPostChar(uint8_t data);
     void _parseMultipartPostByte(uint8_t data, bool last);
     void _addGetParams(const String& params);
+    
+    void _requestReady();
+    void _handleRequest();  // called when the queue permits this request to run
 
     void _handleUploadStart();
     void _handleUploadByte(uint8_t data, bool last);
@@ -252,6 +257,8 @@ class AsyncWebServerRequest {
     AsyncResponseStream *beginResponseStream(const String& contentType, size_t bufferSize=1460);
     AsyncWebServerResponse *beginResponse_P(int code, const String& contentType, const uint8_t * content, size_t len, AwsTemplateProcessor callback=nullptr);
     AsyncWebServerResponse *beginResponse_P(int code, const String& contentType, PGM_P content, AwsTemplateProcessor callback=nullptr);
+
+    void deferResponse();  // Move to the back of the queue
 
     size_t headers() const;                     // get header count
     bool hasHeader(const String& name) const;   // check if header exists
@@ -369,6 +376,7 @@ class AsyncWebServerResponse {
     size_t _writtenLength; // size of data written to client
     WebResponseState _state;
     static const __FlashStringHelper* _responseCodeToString(int code);
+    friend class AsyncWebServer;
 
   public:
     AsyncWebServerResponse();
@@ -387,6 +395,20 @@ class AsyncWebServerResponse {
 };
 
 /*
+ * Queue limit structure for Server
+ * 
+ * Any value set to 0 indicates no limit.
+ * */
+struct AsyncWebServerQueueLimits {
+  // Count limits
+  size_t nParallel;   // Permit up to this number of active parallel requests.
+  size_t nMax;        // Permit up to this number of active + queued requests - send 503 otherwise.
+  // Heap limits  
+  size_t queueHeapRequired;     // Require at least this much free heap before queuing a new request, otherwise send a 503.
+  size_t requestHeapRequired;   // Require at least this much free heap before handling a new request, except if no requests are active.  
+};
+
+/*
  * SERVER :: One instance
  * */
 
@@ -396,14 +418,22 @@ typedef std::function<void(AsyncWebServerRequest *request, uint8_t *data, size_t
 
 class AsyncWebServer {
   protected:
+    AsyncWebServerQueueLimits _queueLimits;
     AsyncServer _server;
     LinkedList<AsyncWebRewrite*> _rewrites;
-    LinkedList<AsyncWebHandler*> _handlers;
+    LinkedList<AsyncWebHandler*> _handlers;    
     AsyncCallbackWebHandler* _catchAllHandler;
-
+#ifdef ASYNCWEBSERVER_NEEDS_MUTEX    
+    std::mutex _mutex;
+#endif
+    LinkedList<AsyncWebServerRequest*> _requestQueue;
+    bool _queueActive;
+    
   public:
     AsyncWebServer(IPAddress addr, uint16_t port);
     AsyncWebServer(uint16_t port);
+    AsyncWebServer(IPAddress addr, uint16_t port, const AsyncWebServerQueueLimits& limits);
+    AsyncWebServer(uint16_t port, const AsyncWebServerQueueLimits& limits);
     ~AsyncWebServer();
 
     void begin();
@@ -433,10 +463,21 @@ class AsyncWebServer {
     void onRequestBody(ArBodyHandlerFunction fn); //handle posts with plain body content (JSON often transmitted this way as a request)
 
     void reset(); //remove all writers and handlers, with onNotFound/onFileUpload/onRequestBody 
+
+    // Queue interface
+    size_t numClients();  // Number of active clients, active and pending
+    size_t queueLength(); // Number of queued clients
+    const AsyncWebServerQueueLimits& getQueueLimits() { return _queueLimits; };
+    void setQueueLimits(const AsyncWebServerQueueLimits& limits);
+    void printStatus(Print&);  // Write queue status in human-readable format
+    void processQueue();  // Consider the current queue state against the limits; may retry deferred handlers.
   
     void _handleDisconnect(AsyncWebServerRequest *request);
     void _attachHandler(AsyncWebServerRequest *request);
     void _rewriteRequest(AsyncWebServerRequest *request);
+    
+    void _dequeue(AsyncWebServerRequest *request);
+    void _defer(AsyncWebServerRequest *request);
 };
 
 class DefaultHeaders {
