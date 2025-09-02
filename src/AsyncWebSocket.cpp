@@ -25,13 +25,15 @@
 
 #ifndef ESP8266
 #if ESP_IDF_VERSION_MAJOR < 5
-#include "./port/SHA1Builder.h"
+#define ASYNCWEBSERVER_USE_MBEDTLS_2
+#include "mbedtls/sha1.h"
 #else
 #include <SHA1Builder.h>
 #endif
 #else
 #include <Hash.h>
 #endif
+
 #ifdef ESP32
 #if ESP_IDF_VERSION_MAJOR >= 5
 #include "rom/ets_sys.h"
@@ -1147,6 +1149,8 @@ const char WS_STR_PROTOCOL[] PROGMEM = "Sec-WebSocket-Protocol";
 const char WS_STR_ACCEPT[] PROGMEM = "Sec-WebSocket-Accept";
 const char WS_STR_UUID[] PROGMEM = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+#define WS_STR_UUID_LEN 36
+
 bool AsyncWebSocket::canHandle(AsyncWebServerRequest *request){
   if(!_enabled)
     return false;
@@ -1224,16 +1228,31 @@ AsyncWebSocketResponse::AsyncWebSocketResponse(const String& key, AsyncWebSocket
   uint8_t hash[20];
   char buffer[33];
 
+  String k;
+  if (!k.reserve(key.length() + WS_STR_UUID_LEN)) {
+    //log_e("Failed to allocate");
+    return;
+  }
+  k.concat(key);
+  k.concat(WS_STR_UUID);
+
 #ifdef ESP8266
-  sha1(key + FPSTR(WS_STR_UUID), hash);
-#else
-    String k = key + WS_STR_UUID;
-    SHA1Builder sha1;
-    sha1.begin();
-    sha1.add((const uint8_t*)k.c_str(), k.length());
-    sha1.calculate();
-    sha1.getBytes(hash);
+  sha1(k, hash);
+#elif defined(ASYNCWEBSERVER_USE_MBEDTLS_2)
+  mbedtls_sha1_context ctx;
+  mbedtls_sha1_init(&ctx);
+  mbedtls_sha1_starts_ret(&ctx);
+  mbedtls_sha1_update_ret(&ctx, (const unsigned char*)k.c_str(), k.length());
+  mbedtls_sha1_finish_ret(&ctx, hash);
+  mbedtls_sha1_free(&ctx);
+#else // Use SHA1Builder*/
+  SHA1Builder sha1;
+  sha1.begin();
+  sha1.add((const uint8_t*)k.c_str(), k.length());
+  sha1.calculate();
+  sha1.getBytes(hash);
 #endif
+
   base64_encodestate _state;
   base64_init_encodestate(&_state);
   int len = base64_encode_block((const char *) hash, 20, buffer, &_state);
